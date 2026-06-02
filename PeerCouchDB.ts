@@ -45,13 +45,20 @@ export class PeerCouchDB extends Peer {
         const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
         // const old = await this.getMeta(path as FilePathWithPrefix);
         if (old && Math.abs(this.compareDate(info, old)) < 3600) {
-            const oldDoc = await this.man.getByMeta(old);
-            if (oldDoc && ("data" in oldDoc)) {
-                const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
-                if (await isDocContentSame(d, saveData)) {
-                    this.normalLog(` Skipped (Same) ${path} `);
-                    return false;
+            try {
+                const oldDoc = await this.man.getByMeta(old);
+                if (oldDoc && ("data" in oldDoc)) {
+                    const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
+                    if (await isDocContentSame(d, saveData)) {
+                        this.normalLog(` Skipped (Same) ${path} `);
+                        return false;
+                    }
                 }
+            } catch (ex) {
+                // Битый/нерасшифрованный СТАРЫЙ документ (напр. неполные чанки) — это лишь
+                // dedup-оптимизация (skip-if-same). НЕ валим bridge на одном документе:
+                // пропускаем сравнение и перезаписываем актуальной версией через put ниже.
+                this.receiveLog(` ${path} dedup-check skipped (corrupted old doc): ${ex}`, LOG_LEVEL_NOTICE);
             }
         }
         const r = await this.man.put(path, saveData, info, type);

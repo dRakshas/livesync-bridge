@@ -26,9 +26,17 @@ export class Hub {
                 throw new Error(`Unexpected Peer type: ${(peer as any)?.name} - ${(peer as any)?.type}`);
             }
         }
-        for (const p of this.peers) {
-            p.start();
-        }
+        // Start CouchDB peers first and wait until each is fully initialized,
+        // then start storage peers. Otherwise a storage offline-scan can dispatch
+        // writes to a CouchDB peer whose local DB (man.ready) is not yet ready.
+        void (async () => {
+            for (const p of this.peers) {
+                if (p instanceof PeerCouchDB) await p.start();
+            }
+            for (const p of this.peers) {
+                if (!(p instanceof PeerCouchDB)) await p.start();
+            }
+        })();
     }
 
     async dispatch(source: Peer, path: string, data: FileData | false) {

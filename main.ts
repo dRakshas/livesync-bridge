@@ -6,6 +6,14 @@ import { parseArgs } from "jsr:@std/cli";
 
 const KEY = "LSB_"
 defaultLoggerEnv.minLogLevel = LOG_LEVEL_DEBUG;
+
+// Страховка (task 2026-06-02-001, item 9): один битый/нерасшифрованный документ
+// (напр. неполные чанки) не должен ронять весь bridge. Логируем непойманный
+// rejection громко и продолжаем работу вместо краша процесса.
+globalThis.addEventListener("unhandledrejection", (e) => {
+    console.error("[bridge] UNHANDLED REJECTION (продолжаю, не падаю):", e.reason);
+    e.preventDefault();
+});
 const configFile = Deno.env.get(`${KEY}CONFIG`) || "./dat/config.json";
 
 console.log("LiveSync Bridge is now starting...");
