@@ -1,10 +1,18 @@
 import { DirectFileManipulator, FileInfo, MetaEntry, ReadyEntry } from "./lib/src/API/DirectFileManipulatorV2.ts";
-import { FilePathWithPrefix, LOG_LEVEL_NOTICE, MILESTONE_DOCID, TweakValues } from "./lib/src/common/types.ts";
+import { FilePathWithPrefix, LOG_LEVEL_NOTICE, LOG_LEVEL_URGENT, LOG_LEVEL_VERBOSE, MILESTONE_DOCID, TweakValues } from "./lib/src/common/types.ts";
 import { PeerCouchDBConf, FileData } from "./types.ts";
 import { decodeBinary } from "./lib/src/string_and_binary/convert.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
 import { DispatchFun, Peer } from "./Peer.ts";
-import { createBinaryBlob, createTextBlob, isDocContentSame, unique } from "./lib/src/common/utils.ts";
+import { createBinaryBlob, createTextBlob, delay, isDocContentSame, unique } from "./lib/src/common/utils.ts";
+import { Logger } from "./lib/src/common/logger.ts";
+import { classifyError, describeError } from "./errorClassification.ts";
+
+// Retry parameters: per задаче 2026-06-07-002 — 3 попытки × 30с только для transient
+// (сеть/таймаут). DecryptionError ретраить НЕЛЬЗЯ (битые данные не починятся).
+// Перед каждой попыткой делаем свежий GET за актуальным _rev (иначе 409-loop сжёг бы все попытки).
+const PUT_MAX_ATTEMPTS = 3;
+const PUT_RETRY_DELAY_MS = 30_000;
 
 // export class PeerInstance()
 
@@ -42,32 +50,60 @@ export class PeerCouchDB extends Peer {
             size: data.size
         };
         const saveData = (data.data instanceof Uint8Array) ? createBinaryBlob(data.data) : createTextBlob(data.data);
-        const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
-        // const old = await this.getMeta(path as FilePathWithPrefix);
-        if (old && Math.abs(this.compareDate(info, old)) < 3600) {
+
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= PUT_MAX_ATTEMPTS; attempt++) {
             try {
-                const oldDoc = await this.man.getByMeta(old);
-                if (oldDoc && ("data" in oldDoc)) {
-                    const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
-                    if (await isDocContentSame(d, saveData)) {
-                        this.normalLog(` Skipped (Same) ${path} `);
-                        return false;
+                // Свежий GET за актуальным _rev перед КАЖДОЙ попыткой —
+                // иначе concurrent-обновление с другого устройства даст 409 на всех 3.
+                const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
+                if (old && Math.abs(this.compareDate(info, old)) < 3600) {
+                    try {
+                        const oldDoc = await this.man.getByMeta(old);
+                        if (oldDoc && ("data" in oldDoc)) {
+                            const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
+                            if (await isDocContentSame(d, saveData)) {
+                                this.normalLog(` Skipped (Same) ${path} `);
+                                return false;
+                            }
+                        }
+                    } catch (ex) {
+                        // Битый/нерасшифрованный СТАРЫЙ документ (напр. неполные чанки) — это лишь
+                        // dedup-оптимизация (skip-if-same). НЕ валим put на одном документе:
+                        // пропускаем сравнение и перезаписываем актуальной версией ниже.
+                        this.receiveLog(` ${path} dedup-check skipped (corrupted old doc): ${describeError(ex)}`, LOG_LEVEL_NOTICE);
                     }
                 }
+                const r = await this.man.put(path, saveData, info, type);
+                if (r) {
+                    this.receiveLog(` ${path} saved`);
+                } else {
+                    this.receiveLog(` ${path} ignored`);
+                }
+                return r;
             } catch (ex) {
-                // Битый/нерасшифрованный СТАРЫЙ документ (напр. неполные чанки) — это лишь
-                // dedup-оптимизация (skip-if-same). НЕ валим bridge на одном документе:
-                // пропускаем сравнение и перезаписываем актуальной версией через put ниже.
-                this.receiveLog(` ${path} dedup-check skipped (corrupted old doc): ${ex}`, LOG_LEVEL_NOTICE);
+                lastError = ex;
+                const cls = classifyError(ex);
+                if (cls === "decryption") {
+                    // Битые данные ретраить бесполезно — это симптом нечитаемого документа.
+                    this.receiveLog(`UNREADABLE_DOC: ${path} — ${describeError(ex)}`, LOG_LEVEL_NOTICE);
+                    return false;
+                }
+                if (cls === "unexpected") {
+                    // TypeError/ReferenceError — реальный баг кода, не глотаем тихо.
+                    this.receiveLog(`CRITICAL put error for ${path} — ${describeError(ex)}`, LOG_LEVEL_URGENT);
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+                // transient: сеть/таймаут/конфликт — ретраим со свежим _rev.
+                this.receiveLog(`${path} transient put error (attempt ${attempt}/${PUT_MAX_ATTEMPTS}): ${describeError(ex)}`, LOG_LEVEL_NOTICE);
+                if (attempt < PUT_MAX_ATTEMPTS) {
+                    await delay(PUT_RETRY_DELAY_MS);
+                }
             }
         }
-        const r = await this.man.put(path, saveData, info, type);
-        if (r) {
-            this.receiveLog(` ${path} saved`);
-        } else {
-            this.receiveLog(` ${path} ignored`);
-        }
-        return r;
+        this.receiveLog(`LOST_TASK: ${path} — gave up after ${PUT_MAX_ATTEMPTS} transient failures: ${describeError(lastError)}`, LOG_LEVEL_URGENT);
+        return false;
     }
     async get(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
         const path = this.toLocalPath(pathSrc) as FilePathWithPrefix;
