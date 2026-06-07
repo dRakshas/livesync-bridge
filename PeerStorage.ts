@@ -1,7 +1,8 @@
-import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "./lib/src/common/types.ts";
+import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_URGENT, LOG_LEVEL_VERBOSE } from "./lib/src/common/types.ts";
 import { PeerStorageConf, FileData } from "./types.ts";
 import { Logger } from "./lib/src/common/logger.ts";
 import { delay, getDocData } from "./lib/src/common/utils.ts";
+import { classifyError, describeError } from "./errorClassification.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
 import { parse, format, relative, dirname, resolve } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix"
@@ -230,19 +231,42 @@ export class PeerStorage extends Peer {
     }
     watcherDeno?: Deno.FsWatcher;
 
+    // Изолирует ошибку одного inotify-события: DecryptionError/битый документ → skip+log,
+    // неожиданная ошибка (TypeError/ReferenceError) → CRITICAL+log, остальное → INFO.
+    // Никогда не пробрасываем выше — иначе теряется вся остальная очередь.
+    private async safeHandle(eventKind: string, path: string, fn: () => Promise<void>) {
+        try {
+            await fn();
+        } catch (ex) {
+            const cls = classifyError(ex);
+            const msg = describeError(ex);
+            if (cls === "decryption") {
+                this.normalLog(`UNREADABLE_DOC: ${path} (${eventKind}) — ${msg}`, LOG_LEVEL_NOTICE);
+            } else if (cls === "unexpected") {
+                this.normalLog(`CRITICAL: unexpected error in ${eventKind} handler for ${path} — ${msg}`, LOG_LEVEL_URGENT);
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            } else {
+                this.normalLog(`${eventKind} handler error for ${path} — ${msg}`, LOG_LEVEL_NOTICE);
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            }
+        }
+    }
+
     processFile(event: Deno.FsEvent) {
         for (const path of event.paths) {
             const key = `${event.kind}-${path}`;
             // const key = path;
             scheduleTask(key, 100, async () => {
-                const existence = await Deno.stat(path).catch(() => null);
-                if (existence) {
-                    if (existence.isFile) {
-                        await this.dispatch(path);
+                await this.safeHandle(event.kind, path, async () => {
+                    const existence = await Deno.stat(path).catch(() => null);
+                    if (existence) {
+                        if (existence.isFile) {
+                            await this.dispatch(path);
+                        }
+                    } else {
+                        await this.dispatchDeleted(path);
                     }
-                } else {
-                    await this.dispatchDeleted(path);
-                }
+                });
             });
         }
     }
@@ -298,28 +322,34 @@ export class PeerStorage extends Peer {
                 },
             });
 
-        this.watcher.on("change", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            if (!await this.isChanged(ePath)) {
-                // this.debugLog(`Not changed: ${ePath}`);
-            } else {
-                this.debugLog(`Changes detected: ${ePath}`);
-                await this.dispatch(path);
-            }
+        this.watcher.on("change", (path) => {
+            void this.safeHandle("change", path, async () => {
+                const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+                if (!await this.isChanged(ePath)) {
+                    // this.debugLog(`Not changed: ${ePath}`);
+                } else {
+                    this.debugLog(`Changes detected: ${ePath}`);
+                    await this.dispatch(path);
+                }
+            });
         })
-        this.watcher.on("add", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            if (!await this.isChanged(ePath)) {
-                // this.debugLog(`Not changed: ${ePath}`);
-            } else {
-                this.debugLog(`New detected: ${ePath}`);
-                await this.dispatch(path);
-            }
+        this.watcher.on("add", (path) => {
+            void this.safeHandle("add", path, async () => {
+                const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+                if (!await this.isChanged(ePath)) {
+                    // this.debugLog(`Not changed: ${ePath}`);
+                } else {
+                    this.debugLog(`New detected: ${ePath}`);
+                    await this.dispatch(path);
+                }
+            });
         })
-        this.watcher.on("unlink", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            this.debugLog(`Unlink detected: ${ePath}`);
-            await this.dispatchDeleted(path)
+        this.watcher.on("unlink", (path) => {
+            void this.safeHandle("unlink", path, async () => {
+                const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+                this.debugLog(`Unlink detected: ${ePath}`);
+                await this.dispatchDeleted(path);
+            });
         })
     }
     async stop() {
