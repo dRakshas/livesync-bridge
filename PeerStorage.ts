@@ -4,7 +4,7 @@ import { Logger } from "./lib/src/common/logger.ts";
 import { delay, getDocData } from "./lib/src/common/utils.ts";
 import { classifyError, describeError } from "./errorClassification.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
-import { parse, format, relative, dirname, resolve } from "@std/path";
+import { parse, format, relative, dirname, resolve, basename, join } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix"
 import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer } from "./Peer.ts";
@@ -12,6 +12,8 @@ import chokidar from "chokidar";
 import { walk } from 'fs/walk';
 
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
+
+const LSBRIDGE_TMP_MARKER = ".lsbridge-tmp-";
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
@@ -45,29 +47,34 @@ export class PeerStorage extends Peer {
             this.receiveLog(`${lp} save repeating`);
             return false;
         }
+        const dirName = dirname(path);
+        const tmpPath = join(dirName, `.${basename(path)}${LSBRIDGE_TMP_MARKER}${crypto.randomUUID()}`);
+        let fp: Deno.FsFile | undefined;
         try {
-            const dirName = dirname(path);
             try {
                 await Deno.mkdir(dirName, { recursive: true });
             } catch (ex) {
-                // While recursive is true, mkdir will not raise the `AlreadyExist`.
                 console.log(ex);
             }
-            const fp = await Deno.open(path, { read: true, write: true, create: true });
-            if (data.data instanceof Uint8Array) {
-                const writtensize = await fp.write(data.data);
-                await fp.truncate(writtensize);
-            } else {
-                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
-                await fp.truncate(writtensize);
-            }
+            fp = await Deno.open(tmpPath, { write: true, create: true, createNew: true });
+            const bytes = data.data instanceof Uint8Array
+                ? data.data
+                : new TextEncoder().encode(getDocData(data.data));
+            await fp.write(bytes);
             await fp.utime(new Date(data.mtime), new Date(data.mtime));
+            await fp.sync();
             fp.close();
-            this.receiveLog(`${lp} saved`);
+            fp = undefined;
+            await Deno.rename(tmpPath, path);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
+            this.receiveLog(`${lp} saved`);
             return true;
         } catch (ex) {
+            if (fp !== undefined) {
+                try { fp.close(); } catch { /* ignore */ }
+            }
+            try { await Deno.remove(tmpPath); } catch { /* ignore */ }
             Logger(ex, LOG_LEVEL_INFO);
             this.receiveLog(`${lp} save failed`);
             return false;
@@ -155,6 +162,7 @@ export class PeerStorage extends Peer {
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
+        if (pathSrc.includes(LSBRIDGE_TMP_MARKER)) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
 
@@ -176,6 +184,7 @@ export class PeerStorage extends Peer {
         });
     }
     async dispatchDeleted(pathSrc: string) {
+        if (pathSrc.includes(LSBRIDGE_TMP_MARKER)) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
         await scheduleOnceIfDuplicated(pathSrc, async () => {
@@ -317,6 +326,7 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
+                ignored: (path: string) => path.includes(LSBRIDGE_TMP_MARKER),
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
