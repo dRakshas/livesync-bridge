@@ -41,8 +41,8 @@ export class PeerStorage extends Peer {
     async put(pathSrc: string, data: FileData): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
-        // Reject paths using the reserved tmp prefix — prevents CouchDB docs named
-        // .lsbridge-tmp-* from colliding with our atomic write temporaries.
+        // Reject paths whose basename uses the reserved tmp prefix — prevents CouchDB docs
+        // named .lsbridge-tmp-* from colliding with our atomic write temporaries.
         if (parse(path).base.startsWith('.lsbridge-tmp-')) {
             this.receiveLog(`${lp} skipped: .lsbridge-tmp- prefix is reserved for atomic writes`);
             return false;
@@ -51,26 +51,15 @@ export class PeerStorage extends Peer {
             this.receiveLog(`${lp} save repeating`);
             return false;
         }
-        let tmpPath: string | undefined;
+        const dirName = dirname(path);
+        // .lsbridge-tmp- prefix is reserved; the guard above ensures path.base never carries it.
+        const tmpPath = join(dirName, `.lsbridge-tmp-${parse(path).base}`);
         try {
-            const dirName = dirname(path);
             try {
                 await Deno.mkdir(dirName, { recursive: true });
-            } catch (ex) {
-                // While recursive is true, mkdir will not raise the `AlreadyExist`.
-                console.log(ex);
+            } catch {
+                // ignored; will surface as open error if dir is inaccessible
             }
-            // Atomic write: write to tmp, then rename — ensures no partial file visible.
-            const TMP_PREFIX = ".lsbridge-tmp-";
-            const base = parse(path).base;
-            // Keep tmp filename within 255-byte FS limit (prefix is 14 chars).
-            const safeBase = TMP_PREFIX.length + base.length > 255
-                ? base.slice(0, 255 - TMP_PREFIX.length)
-                : base;
-            tmpPath = join(dirName, TMP_PREFIX + safeBase);
-            const content = data.data instanceof Uint8Array
-                ? data.data
-                : new TextEncoder().encode(getDocData(data.data));
             // Capture existing file's permissions before overwrite; rename resets them to umask.
             let existingMode: number | undefined;
             try {
@@ -79,13 +68,27 @@ export class PeerStorage extends Peer {
             } catch {
                 // file doesn't exist yet — no permissions to preserve
             }
-            await Deno.writeFile(tmpPath, content);
+            const fp = await Deno.open(tmpPath, { write: true, create: true, truncate: true });
+            try {
+                const encoded = data.data instanceof Uint8Array
+                    ? data.data
+                    : new TextEncoder().encode(getDocData(data.data));
+                await fp.write(encoded);
+                await fp.sync();
+                await fp.utime(new Date(data.mtime), new Date(data.mtime));
+            } finally {
+                fp.close();
+            }
             await Deno.rename(tmpPath, path);
             if (existingMode !== undefined) {
                 // Restore permissions lost when rename replaced the old inode.
                 try { await Deno.chmod(path, existingMode); } catch { /* Windows / restricted FS */ }
             }
-            await Deno.utime(path, new Date(data.mtime), new Date(data.mtime));
+            // Sync the parent directory so the rename directory-entry survives power loss
+            // (matters on ext4 data=writeback and similar FS configurations).
+            await Deno.open(dirName, { read: true }).then(async (df) => {
+                try { await df.sync(); } finally { df.close(); }
+            }).catch(() => {});
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
@@ -93,7 +96,7 @@ export class PeerStorage extends Peer {
         } catch (ex) {
             Logger(ex, LOG_LEVEL_INFO);
             this.receiveLog(`${lp} save failed`);
-            if (tmpPath) await Deno.remove(tmpPath).catch(() => {});
+            await Deno.remove(tmpPath).catch(() => {});
             return false;
         }
     }
@@ -253,6 +256,7 @@ export class PeerStorage extends Peer {
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
+        if (parse(pathSrc).base.startsWith('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
 
@@ -274,6 +278,7 @@ export class PeerStorage extends Peer {
         });
     }
     async dispatchDeleted(pathSrc: string) {
+        if (parse(pathSrc).base.startsWith('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
         await scheduleOnceIfDuplicated(pathSrc, async () => {
