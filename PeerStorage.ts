@@ -4,7 +4,7 @@ import { Logger } from "./lib/src/common/logger.ts";
 import { delay, getDocData } from "./lib/src/common/utils.ts";
 import { classifyError, describeError } from "./errorClassification.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
-import { parse, format, relative, dirname, resolve } from "@std/path";
+import { parse, format, relative, dirname, resolve, join } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix"
 import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer } from "./Peer.ts";
@@ -41,10 +41,17 @@ export class PeerStorage extends Peer {
     async put(pathSrc: string, data: FileData): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
+        // Reject paths using the reserved tmp prefix — prevents CouchDB docs named
+        // .lsbridge-tmp-* from colliding with our atomic write temporaries.
+        if (parse(path).base.startsWith('.lsbridge-tmp-')) {
+            this.receiveLog(`${lp} skipped: .lsbridge-tmp- prefix is reserved for atomic writes`);
+            return false;
+        }
         if (await this.isRepeating(lp, data)) {
             this.receiveLog(`${lp} save repeating`);
             return false;
         }
+        let tmpPath: string | undefined;
         try {
             const dirName = dirname(path);
             try {
@@ -54,12 +61,30 @@ export class PeerStorage extends Peer {
                 console.log(ex);
             }
             // Atomic write: write to tmp, then rename — ensures no partial file visible.
-            const tmpPath = `${dirName}/.lsbridge-tmp-${parse(path).base}`;
+            const TMP_PREFIX = ".lsbridge-tmp-";
+            const base = parse(path).base;
+            // Keep tmp filename within 255-byte FS limit (prefix is 14 chars).
+            const safeBase = TMP_PREFIX.length + base.length > 255
+                ? base.slice(0, 255 - TMP_PREFIX.length)
+                : base;
+            tmpPath = join(dirName, TMP_PREFIX + safeBase);
             const content = data.data instanceof Uint8Array
                 ? data.data
                 : new TextEncoder().encode(getDocData(data.data));
+            // Capture existing file's permissions before overwrite; rename resets them to umask.
+            let existingMode: number | undefined;
+            try {
+                const existingStat = await Deno.stat(path);
+                if (existingStat.mode != null) existingMode = existingStat.mode & 0o7777;
+            } catch {
+                // file doesn't exist yet — no permissions to preserve
+            }
             await Deno.writeFile(tmpPath, content);
             await Deno.rename(tmpPath, path);
+            if (existingMode !== undefined) {
+                // Restore permissions lost when rename replaced the old inode.
+                try { await Deno.chmod(path, existingMode); } catch { /* Windows / restricted FS */ }
+            }
             await Deno.utime(path, new Date(data.mtime), new Date(data.mtime));
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
@@ -68,6 +93,7 @@ export class PeerStorage extends Peer {
         } catch (ex) {
             Logger(ex, LOG_LEVEL_INFO);
             this.receiveLog(`${lp} save failed`);
+            if (tmpPath) await Deno.remove(tmpPath).catch(() => {});
             return false;
         }
     }
@@ -150,7 +176,13 @@ export class PeerStorage extends Peer {
         }
         return ret;
     }
-    /** Removes orphaned .lsbridge-tmp-* files from the vault on startup and returns count deleted. */
+    /**
+     * Removes orphaned `.lsbridge-tmp-*` files from the vault on startup and returns count deleted.
+     *
+     * WARNING: The `.lsbridge-tmp-` prefix is reserved by livesync-bridge for atomic writes.
+     * Any vault file whose name begins with `.lsbridge-tmp-` will be deleted on startup.
+     * Do not name user files with this prefix.
+     */
     async cleanupTmpFiles(): Promise<number> {
         const lP = this.toStoragePath(this.toLocalPath("."));
         let count = 0;
@@ -190,6 +222,7 @@ export class PeerStorage extends Peer {
     private async _cleanupStaleTmpFiles(maxAgeMs: number): Promise<void> {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const now = Date.now();
+        let count = 0;
         try {
             for await (const entry of walk(lP)) {
                 if (!entry.isFile || !entry.name.startsWith(".lsbridge-tmp-")) continue;
@@ -199,13 +232,21 @@ export class PeerStorage extends Peer {
                     if (age > maxAgeMs) {
                         await Deno.remove(entry.path);
                         this.normalLog(`tmpguard: removed stale tmp (${Math.round(age / 60000)}min old): ${entry.path}`, LOG_LEVEL_NOTICE);
+                        count++;
                     }
                 } catch {
-                    // file may have already been removed
+                    // file may have already been removed by a concurrent operation
                 }
             }
-        } catch {
-            // vault dir may not exist yet
+        } catch (ex) {
+            if (!(ex instanceof Deno.errors.NotFound)) {
+                this.normalLog(`tmpguard: walk error: ${ex}`, LOG_LEVEL_NOTICE);
+            }
+        }
+        if (count > 0) {
+            const prev = parseInt(this.getSetting("temp_cleaned_by_guard") ?? "0", 10);
+            this.setSetting("temp_cleaned_by_guard", String(prev + count));
+            this.normalLog(`tmpguard: temp_cleaned_by_guard: ${prev + count} total (${count} this tick)`, LOG_LEVEL_NOTICE);
         }
     }
 
