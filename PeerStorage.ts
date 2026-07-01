@@ -4,7 +4,7 @@ import { Logger } from "./lib/src/common/logger.ts";
 import { delay, getDocData } from "./lib/src/common/utils.ts";
 import { classifyError, describeError } from "./errorClassification.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
-import { parse, format, relative, dirname, resolve } from "@std/path";
+import { parse, format, relative, dirname, resolve, join } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix"
 import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer } from "./Peer.ts";
@@ -45,24 +45,26 @@ export class PeerStorage extends Peer {
             this.receiveLog(`${lp} save repeating`);
             return false;
         }
+        const dirName = dirname(path);
+        const tmpPath = join(dirName, `.lsbridge-tmp-${parse(path).base}`);
         try {
-            const dirName = dirname(path);
             try {
                 await Deno.mkdir(dirName, { recursive: true });
-            } catch (ex) {
-                // While recursive is true, mkdir will not raise the `AlreadyExist`.
-                console.log(ex);
+            } catch {
+                // ignored; will surface as open error if dir is inaccessible
             }
-            const fp = await Deno.open(path, { read: true, write: true, create: true });
-            if (data.data instanceof Uint8Array) {
-                const writtensize = await fp.write(data.data);
-                await fp.truncate(writtensize);
-            } else {
-                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
-                await fp.truncate(writtensize);
+            const fp = await Deno.open(tmpPath, { write: true, create: true, truncate: true });
+            try {
+                const encoded = data.data instanceof Uint8Array
+                    ? data.data
+                    : new TextEncoder().encode(getDocData(data.data));
+                await fp.write(encoded);
+                await fp.sync();
+                await fp.utime(new Date(data.mtime), new Date(data.mtime));
+            } finally {
+                fp.close();
             }
-            await fp.utime(new Date(data.mtime), new Date(data.mtime));
-            fp.close();
+            await Deno.rename(tmpPath, path);
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
@@ -70,6 +72,7 @@ export class PeerStorage extends Peer {
         } catch (ex) {
             Logger(ex, LOG_LEVEL_INFO);
             this.receiveLog(`${lp} save failed`);
+            await Deno.remove(tmpPath).catch(() => {});
             return false;
         }
     }
@@ -155,6 +158,7 @@ export class PeerStorage extends Peer {
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
+        if (pathSrc.includes('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
 
@@ -176,6 +180,7 @@ export class PeerStorage extends Peer {
         });
     }
     async dispatchDeleted(pathSrc: string) {
+        if (pathSrc.includes('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
         await scheduleOnceIfDuplicated(pathSrc, async () => {
@@ -317,6 +322,7 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
+                ignored: (filePath: string) => filePath.includes('.lsbridge-tmp-'),
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
