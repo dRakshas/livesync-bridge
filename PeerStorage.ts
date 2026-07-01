@@ -53,16 +53,14 @@ export class PeerStorage extends Peer {
                 // While recursive is true, mkdir will not raise the `AlreadyExist`.
                 console.log(ex);
             }
-            const fp = await Deno.open(path, { read: true, write: true, create: true });
-            if (data.data instanceof Uint8Array) {
-                const writtensize = await fp.write(data.data);
-                await fp.truncate(writtensize);
-            } else {
-                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
-                await fp.truncate(writtensize);
-            }
-            await fp.utime(new Date(data.mtime), new Date(data.mtime));
-            fp.close();
+            // Atomic write: write to tmp, then rename — ensures no partial file visible.
+            const tmpPath = `${dirName}/.lsbridge-tmp-${parse(path).base}`;
+            const content = data.data instanceof Uint8Array
+                ? data.data
+                : new TextEncoder().encode(getDocData(data.data));
+            await Deno.writeFile(tmpPath, content);
+            await Deno.rename(tmpPath, path);
+            await Deno.utime(path, new Date(data.mtime), new Date(data.mtime));
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
@@ -152,6 +150,65 @@ export class PeerStorage extends Peer {
         }
         return ret;
     }
+    /** Removes orphaned .lsbridge-tmp-* files from the vault on startup and returns count deleted. */
+    async cleanupTmpFiles(): Promise<number> {
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        let count = 0;
+        try {
+            for await (const entry of walk(lP)) {
+                if (!entry.isFile || !entry.name.startsWith(".lsbridge-tmp-")) continue;
+                try {
+                    await Deno.remove(entry.path);
+                    this.normalLog(`startup: removed orphaned tmp file: ${entry.path}`, LOG_LEVEL_NOTICE);
+                    count++;
+                } catch (ex) {
+                    this.normalLog(`startup: failed to remove tmp file: ${entry.path}`, LOG_LEVEL_NOTICE);
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                }
+            }
+        } catch (ex) {
+            if (!(ex instanceof Deno.errors.NotFound)) {
+                this.normalLog(`startup tmp cleanup walk error: ${ex}`, LOG_LEVEL_NOTICE);
+            }
+        }
+        if (count > 0) {
+            const prev = parseInt(this.getSetting("temp_cleaned_on_start") ?? "0", 10);
+            this.setSetting("temp_cleaned_on_start", String(prev + count));
+            this.normalLog(`temp_cleaned_on_start: ${prev + count} total (${count} this start)`, LOG_LEVEL_NOTICE);
+        }
+        return count;
+    }
+
+    private _tmpAgeTimerId?: ReturnType<typeof setInterval>;
+
+    private _startTmpAgeGuard(maxAgeMs: number): void {
+        this._tmpAgeTimerId = setInterval(() => {
+            void this._cleanupStaleTmpFiles(maxAgeMs);
+        }, 60_000);
+    }
+
+    private async _cleanupStaleTmpFiles(maxAgeMs: number): Promise<void> {
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        const now = Date.now();
+        try {
+            for await (const entry of walk(lP)) {
+                if (!entry.isFile || !entry.name.startsWith(".lsbridge-tmp-")) continue;
+                try {
+                    const stat = await Deno.stat(entry.path);
+                    const age = now - (stat.mtime?.getTime() ?? 0);
+                    if (age > maxAgeMs) {
+                        await Deno.remove(entry.path);
+                        this.normalLog(`tmpguard: removed stale tmp (${Math.round(age / 60000)}min old): ${entry.path}`, LOG_LEVEL_NOTICE);
+                    }
+                } catch {
+                    // file may have already been removed
+                }
+            }
+        } catch {
+            // vault dir may not exist yet
+        }
+    }
+
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
@@ -254,6 +311,7 @@ export class PeerStorage extends Peer {
 
     processFile(event: Deno.FsEvent) {
         for (const path of event.paths) {
+            if (parse(path).base.startsWith(".lsbridge-tmp-")) continue;
             const key = `${event.kind}-${path}`;
             // const key = path;
             scheduleTask(key, 100, async () => {
@@ -282,7 +340,7 @@ export class PeerStorage extends Peer {
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
         if (this.config.scanOfflineChanges) {
             for await (const entry of walk(lP)) {
-                if (entry.isFile) {
+                if (entry.isFile && !entry.name.startsWith(".lsbridge-tmp-")) {
                     const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
                     if (await this.isChanged(ePath)) {
                         this.debugLog(`Offline changes detected: ${ePath}`);
@@ -302,6 +360,11 @@ export class PeerStorage extends Peer {
 
     }
     async start() {
+        await this.cleanupTmpFiles();
+        if (this.config.tmpAgeGuardMinutes) {
+            this._startTmpAgeGuard(this.config.tmpAgeGuardMinutes * 60_000);
+        }
+
         // For addressing Deno's and chokidar's compatibility issues (especially on Windows), we use Deno's fs watcher as the primary watcher.
         if (!this.config.useChokidar) {
             await this.startDenoFsWatch();
@@ -317,6 +380,7 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
+                ignored: (filePath: string) => parse(filePath).base.startsWith(".lsbridge-tmp-"),
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
@@ -353,6 +417,10 @@ export class PeerStorage extends Peer {
         })
     }
     async stop() {
+        if (this._tmpAgeTimerId !== undefined) {
+            clearInterval(this._tmpAgeTimerId);
+            this._tmpAgeTimerId = undefined;
+        }
         this.watcher?.close();
         this.watcherDeno?.close();
         this.watcherDeno = undefined;

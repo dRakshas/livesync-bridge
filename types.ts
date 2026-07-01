@@ -16,6 +16,8 @@ export interface PeerStorageConf {
         args: string[]
     }
     useChokidar?: boolean;
+    /** Delete .lsbridge-tmp-* files older than this many minutes during normal operation (optional guard). */
+    tmpAgeGuardMinutes?: number;
 }
 export interface PeerCouchDBConf extends DirectFileManipulatorOptions {
     type: "couchdb";
