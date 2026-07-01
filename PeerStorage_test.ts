@@ -79,7 +79,28 @@ Deno.test("put: tmp file is removed when rename fails", async () => {
     }
 });
 
-// ── Test 3: dispatch() guard — tmp path returns early, hub not called ───────
+// ── Test 3: put() guard — reserved .lsbridge-tmp- prefix is rejected ────────
+
+Deno.test("put: rejects path whose basename starts with .lsbridge-tmp-", async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+        const peer = makePeer(dir);
+        const ok = await peer.put(".lsbridge-tmp-notes.md", textData("should not be written"));
+        assertEquals(ok, false, "put must reject paths using the reserved .lsbridge-tmp- prefix");
+
+        // Neither the destination nor a nested tmp should have been created
+        let destExists = false;
+        let doubleTmpExists = false;
+        try { await Deno.stat(join(dir, ".lsbridge-tmp-notes.md")); destExists = true; } catch { /* expected */ }
+        try { await Deno.stat(join(dir, ".lsbridge-tmp-.lsbridge-tmp-notes.md")); doubleTmpExists = true; } catch { /* expected */ }
+        assertEquals(destExists, false, "no destination file should be created");
+        assertEquals(doubleTmpExists, false, "no nested tmp file should be created");
+    } finally {
+        await Deno.remove(dir, { recursive: true });
+    }
+});
+
+// ── Test 4: dispatch() guard (basename check) — tmp path returns early, hub not called ───────
 
 Deno.test("dispatch: .lsbridge-tmp- path is ignored, hub not called", async () => {
     const dir = await Deno.makeTempDir();
@@ -99,7 +120,7 @@ Deno.test("dispatch: .lsbridge-tmp- path is ignored, hub not called", async () =
     }
 });
 
-// ── Test 4: dispatchDeleted() guard — defense-in-depth ─────────────────────
+// ── Test 5: dispatchDeleted() guard (basename check) — defense-in-depth ────
 
 Deno.test("dispatchDeleted: .lsbridge-tmp- path is ignored, hub not called", async () => {
     const dir = await Deno.makeTempDir();
@@ -117,7 +138,7 @@ Deno.test("dispatchDeleted: .lsbridge-tmp- path is ignored, hub not called", asy
     }
 });
 
-// ── Test 5: offline scan (Deno branch, scanOfflineChanges:true) ─────────────
+// ── Test 6: offline scan (Deno branch, scanOfflineChanges:true) ─────────────
 // Orphaned .lsbridge-tmp-* file in dir is walked but dispatch() guard fires early;
 // the real file IS dispatched.
 

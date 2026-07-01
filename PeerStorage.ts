@@ -41,11 +41,18 @@ export class PeerStorage extends Peer {
     async put(pathSrc: string, data: FileData): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
+        // Reject paths whose basename uses the reserved tmp prefix — prevents CouchDB docs
+        // named .lsbridge-tmp-* from colliding with our atomic write temporaries.
+        if (parse(path).base.startsWith('.lsbridge-tmp-')) {
+            this.receiveLog(`${lp} skipped: .lsbridge-tmp- prefix is reserved for atomic writes`);
+            return false;
+        }
         if (await this.isRepeating(lp, data)) {
             this.receiveLog(`${lp} save repeating`);
             return false;
         }
         const dirName = dirname(path);
+        // .lsbridge-tmp- prefix is reserved; the guard above ensures path.base never carries it.
         const tmpPath = join(dirName, `.lsbridge-tmp-${parse(path).base}`);
         try {
             try {
@@ -65,6 +72,11 @@ export class PeerStorage extends Peer {
                 fp.close();
             }
             await Deno.rename(tmpPath, path);
+            // Sync the parent directory so the rename directory-entry survives power loss
+            // (matters on ext4 data=writeback and similar FS configurations).
+            await Deno.open(dirName, { read: true }).then(async (df) => {
+                try { await df.sync(); } finally { df.close(); }
+            }).catch(() => {});
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
@@ -158,7 +170,7 @@ export class PeerStorage extends Peer {
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
-        if (pathSrc.includes('.lsbridge-tmp-')) return;
+        if (parse(pathSrc).base.startsWith('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
 
@@ -180,7 +192,7 @@ export class PeerStorage extends Peer {
         });
     }
     async dispatchDeleted(pathSrc: string) {
-        if (pathSrc.includes('.lsbridge-tmp-')) return;
+        if (parse(pathSrc).base.startsWith('.lsbridge-tmp-')) return;
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
         await scheduleOnceIfDuplicated(pathSrc, async () => {
@@ -322,7 +334,7 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
-                ignored: (filePath: string) => filePath.includes('.lsbridge-tmp-'),
+                ignored: (filePath: string) => parse(filePath).base.startsWith('.lsbridge-tmp-'),
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
