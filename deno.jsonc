@@ -2,9 +2,10 @@
     "tasks": {
         "dev": "deno run --watch -A main.ts",
         "run": "deno run -A main.ts",
-        "test": "deno test -A --no-check PeerStorage_test.ts"
+        "test": "deno test -A --no-check PeerStorage.test.ts"
     },
     "imports": {
+        "@lib/": "./lib/src/",
         "./lib/src/worker/bgWorker.ts": "./lib/src/worker/bgWorker.mock.ts",
         "./lib/src/worker/bgWorker": "./lib/src/worker/bgWorker.mock.ts",
         "fs/walk": "jsr:@std/fs@^1.0.17/",

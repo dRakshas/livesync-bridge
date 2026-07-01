@@ -52,13 +52,26 @@ export class PeerStorage extends Peer {
             return false;
         }
         const dirName = dirname(path);
-        // .lsbridge-tmp- prefix is reserved; the guard above ensures path.base never carries it.
-        const tmpPath = join(dirName, `.lsbridge-tmp-${parse(path).base}`);
+        const TMP_PREFIX = ".lsbridge-tmp-";
+        const base = parse(path).base;
+        // Keep tmp filename within 255-byte FS limit (prefix is 14 bytes).
+        const safeBase = TMP_PREFIX.length + base.length > 255
+            ? base.slice(0, 255 - TMP_PREFIX.length)
+            : base;
+        const tmpPath = join(dirName, TMP_PREFIX + safeBase);
         try {
             try {
                 await Deno.mkdir(dirName, { recursive: true });
             } catch {
                 // ignored; will surface as open error if dir is inaccessible
+            }
+            // Capture existing file's permissions before overwrite; rename resets them to umask.
+            let existingMode: number | undefined;
+            try {
+                const existingStat = await Deno.stat(path);
+                if (existingStat.mode != null) existingMode = existingStat.mode & 0o7777;
+            } catch {
+                // file doesn't exist yet — no permissions to preserve
             }
             const fp = await Deno.open(tmpPath, { write: true, create: true, truncate: true });
             try {
@@ -72,6 +85,10 @@ export class PeerStorage extends Peer {
                 fp.close();
             }
             await Deno.rename(tmpPath, path);
+            if (existingMode !== undefined) {
+                // Restore permissions lost when rename replaced the old inode.
+                try { await Deno.chmod(path, existingMode); } catch { /* Windows / restricted FS */ }
+            }
             // Sync the parent directory so the rename directory-entry survives power loss
             // (matters on ext4 data=writeback and similar FS configurations).
             await Deno.open(dirName, { read: true }).then(async (df) => {
@@ -167,6 +184,80 @@ export class PeerStorage extends Peer {
         }
         return ret;
     }
+    /**
+     * Removes orphaned `.lsbridge-tmp-*` files from the vault on startup and returns count deleted.
+     *
+     * WARNING: The `.lsbridge-tmp-` prefix is reserved by livesync-bridge for atomic writes.
+     * Any vault file whose name begins with `.lsbridge-tmp-` will be deleted on startup.
+     * Do not name user files with this prefix.
+     */
+    async cleanupTmpFiles(): Promise<number> {
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        let count = 0;
+        try {
+            for await (const entry of walk(lP)) {
+                if (!entry.isFile || !entry.name.startsWith(".lsbridge-tmp-")) continue;
+                try {
+                    await Deno.remove(entry.path);
+                    this.normalLog(`startup: removed orphaned tmp file: ${entry.path}`, LOG_LEVEL_NOTICE);
+                    count++;
+                } catch (ex) {
+                    this.normalLog(`startup: failed to remove tmp file: ${entry.path}`, LOG_LEVEL_NOTICE);
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                }
+            }
+        } catch (ex) {
+            if (!(ex instanceof Deno.errors.NotFound)) {
+                this.normalLog(`startup tmp cleanup walk error: ${ex}`, LOG_LEVEL_NOTICE);
+            }
+        }
+        if (count > 0) {
+            const prev = parseInt(this.getSetting("temp_cleaned_on_start") ?? "0", 10);
+            this.setSetting("temp_cleaned_on_start", String(prev + count));
+            this.normalLog(`temp_cleaned_on_start: ${prev + count} total (${count} this start)`, LOG_LEVEL_NOTICE);
+        }
+        return count;
+    }
+
+    private _tmpAgeTimerId?: ReturnType<typeof setInterval>;
+
+    private _startTmpAgeGuard(maxAgeMs: number): void {
+        this._tmpAgeTimerId = setInterval(() => {
+            void this._cleanupStaleTmpFiles(maxAgeMs);
+        }, 60_000);
+    }
+
+    private async _cleanupStaleTmpFiles(maxAgeMs: number): Promise<void> {
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        const now = Date.now();
+        let count = 0;
+        try {
+            for await (const entry of walk(lP)) {
+                if (!entry.isFile || !entry.name.startsWith(".lsbridge-tmp-")) continue;
+                try {
+                    const stat = await Deno.stat(entry.path);
+                    const age = now - (stat.mtime?.getTime() ?? 0);
+                    if (age > maxAgeMs) {
+                        await Deno.remove(entry.path);
+                        this.normalLog(`tmpguard: removed stale tmp (${Math.round(age / 60000)}min old): ${entry.path}`, LOG_LEVEL_NOTICE);
+                        count++;
+                    }
+                } catch {
+                    // file may have already been removed by a concurrent operation
+                }
+            }
+        } catch (ex) {
+            if (!(ex instanceof Deno.errors.NotFound)) {
+                this.normalLog(`tmpguard: walk error: ${ex}`, LOG_LEVEL_NOTICE);
+            }
+        }
+        if (count > 0) {
+            const prev = parseInt(this.getSetting("temp_cleaned_by_guard") ?? "0", 10);
+            this.setSetting("temp_cleaned_by_guard", String(prev + count));
+            this.normalLog(`tmpguard: temp_cleaned_by_guard: ${prev + count} total (${count} this tick)`, LOG_LEVEL_NOTICE);
+        }
+    }
+
     watcher?: chokidar.FSWatcher;
 
     async dispatch(pathSrc: string) {
@@ -271,6 +362,7 @@ export class PeerStorage extends Peer {
 
     processFile(event: Deno.FsEvent) {
         for (const path of event.paths) {
+            if (parse(path).base.startsWith(".lsbridge-tmp-")) continue;
             const key = `${event.kind}-${path}`;
             // const key = path;
             scheduleTask(key, 100, async () => {
@@ -299,7 +391,7 @@ export class PeerStorage extends Peer {
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
         if (this.config.scanOfflineChanges) {
             for await (const entry of walk(lP)) {
-                if (entry.isFile) {
+                if (entry.isFile && !entry.name.startsWith(".lsbridge-tmp-")) {
                     const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
                     if (await this.isChanged(ePath)) {
                         this.debugLog(`Offline changes detected: ${ePath}`);
@@ -319,6 +411,11 @@ export class PeerStorage extends Peer {
 
     }
     async start() {
+        await this.cleanupTmpFiles();
+        if (this.config.tmpAgeGuardMinutes) {
+            this._startTmpAgeGuard(this.config.tmpAgeGuardMinutes * 60_000);
+        }
+
         // For addressing Deno's and chokidar's compatibility issues (especially on Windows), we use Deno's fs watcher as the primary watcher.
         if (!this.config.useChokidar) {
             await this.startDenoFsWatch();
@@ -334,7 +431,7 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
-                ignored: (filePath: string) => parse(filePath).base.startsWith('.lsbridge-tmp-'),
+                ignored: (filePath: string) => parse(filePath).base.startsWith(".lsbridge-tmp-"),
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
@@ -371,6 +468,10 @@ export class PeerStorage extends Peer {
         })
     }
     async stop() {
+        if (this._tmpAgeTimerId !== undefined) {
+            clearInterval(this._tmpAgeTimerId);
+            this._tmpAgeTimerId = undefined;
+        }
         this.watcher?.close();
         this.watcherDeno?.close();
         this.watcherDeno = undefined;
