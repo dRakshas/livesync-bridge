@@ -327,3 +327,28 @@ Deno.test("put after crash cleanup: successful put works after orphan removed", 
         await Deno.remove(dir, { recursive: true });
     }
 });
+
+// Regression guard: basename > 241 bytes would make ".lsbridge-tmp-" + basename > 255 bytes,
+// which is the per-component filename limit on ext4/xfs/btrfs/APFS → ENAMETOOLONG.
+Deno.test("put: basename >241 bytes does not cause ENAMETOOLONG", async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+        // 242-byte basename: ".lsbridge-tmp-" (14) + 242 = 256 > 255 — must be capped.
+        const longBase = "a".repeat(242) + ".md";
+        const peer = makePeer(dir);
+        const ok = await peer.put(longBase, textData("long-name content"));
+
+        assertEquals(ok, true, "put must succeed even when basename exceeds 241 bytes");
+        // The actual stored filename equals longBase (the destination path is unchanged).
+        assertEquals(await Deno.readTextFile(join(dir, longBase)), "long-name content");
+        // No tmp file should remain with any suffix of longBase.
+        for await (const entry of Deno.readDir(dir)) {
+            assertFalse(
+                entry.name.startsWith(".lsbridge-tmp-"),
+                `unexpected tmp file left behind: ${entry.name}`,
+            );
+        }
+    } finally {
+        await Deno.remove(dir, { recursive: true });
+    }
+});

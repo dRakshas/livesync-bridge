@@ -52,8 +52,13 @@ export class PeerStorage extends Peer {
             return false;
         }
         const dirName = dirname(path);
-        // .lsbridge-tmp- prefix is reserved; the guard above ensures path.base never carries it.
-        const tmpPath = join(dirName, `.lsbridge-tmp-${parse(path).base}`);
+        const TMP_PREFIX = ".lsbridge-tmp-";
+        const base = parse(path).base;
+        // Keep tmp filename within 255-byte FS limit (prefix is 14 bytes).
+        const safeBase = TMP_PREFIX.length + base.length > 255
+            ? base.slice(0, 255 - TMP_PREFIX.length)
+            : base;
+        const tmpPath = join(dirName, TMP_PREFIX + safeBase);
         try {
             try {
                 await Deno.mkdir(dirName, { recursive: true });
