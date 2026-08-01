@@ -338,6 +338,9 @@ export class PeerStorage extends Peer {
         return false;
     }
     watcherDeno?: Deno.FsWatcher;
+    // Счётчик ошибок наблюдателя с момента старта: отличает «одиночный блип»
+    // от «сыплется» прямо в строке журнала, без внешнего агрегатора.
+    watcherErrors = 0;
 
     // Изолирует ошибку одного inotify-события: DecryptionError/битый документ → skip+log,
     // неожиданная ошибка (TypeError/ReferenceError) → CRITICAL+log, остальное → INFO.
@@ -465,6 +468,28 @@ export class PeerStorage extends Peer {
                 this.debugLog(`Unlink detected: ${ePath}`);
                 await this.dispatchDeleted(path);
             });
+        })
+        // Наблюдатель — единственный источник ИСХОДЯЩИХ событий (файлы→CouchDB).
+        // Без подписки на 'error' его отказ (EACCES/EPERM/ENOSPC на inotify) уходит
+        // из EventEmitter мимо журнала моста и всплывает анонимным
+        // «UNHANDLED REJECTION» в main.ts — по нему нельзя понять, что умер именно
+        // наблюдатель, а он после этого молчит навсегда. Проводим наружу.
+        this.watcher.on("error", (err) => {
+            this.watcherErrors++;
+            this.normalLog(
+                `WATCHER_ERROR: наблюдатель ${lP} отдал ошибку — ${describeError(err)}`
+                + ` (класс ${classifyError(err)}; ошибок с запуска: ${this.watcherErrors});`
+                + ` изменения файлов могут не доходить до CouchDB`,
+                LOG_LEVEL_URGENT);
+        })
+        // Строка старта: без неё «наблюдатель поднят и говорить нечего» и
+        // «наблюдатель не поднимался вовсе» выглядят в журнале одинаково.
+        this.watcher.on("ready", () => {
+            this.normalLog(
+                `WATCHER_READY: наблюдатель на ${lP} поднят (chokidar),`
+                + ` подписки: change/add/unlink/error;`
+                + ` ошибок наблюдателя с запуска: ${this.watcherErrors}`,
+                LOG_LEVEL_NOTICE);
         })
     }
     async stop() {
